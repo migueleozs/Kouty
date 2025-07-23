@@ -60,6 +60,7 @@ public static class WavUtility
             
             // Convert the short (Int16) value into 2 bytes and write them to the buffer.
             // WAV files typically use little-endian byte order for sample data.
+            // This bit shifting ensures correct little-endian byte order explicitly.
             buffer[p++] = (byte)(value >> 0); // Low byte
             buffer[p++] = (byte)(value >> 8); // High byte
         }

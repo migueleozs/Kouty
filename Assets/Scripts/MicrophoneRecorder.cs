@@ -42,7 +42,7 @@ public class MicrophoneRecorder : MonoBehaviour
         yield return new WaitForSeconds(5f); // Main recording duration (e.g., 5 seconds)
         
         // Now call StopRecordingAndSave() using the maxRecordedPosition we tracked
-        StopRecordingAndSave(maxRecordedPosition); 
+        StopRecordingAndSave(); // No longer passing maxRecordedPosition, it's used internally.
     }
 
     IEnumerator StartRecordingAndConfirmData()
@@ -50,7 +50,7 @@ public class MicrophoneRecorder : MonoBehaviour
         if (Microphone.devices.Length == 0)
         {
             Debug.LogError("❌ No se detectó ningún micrófono.");
-            yield break; // Exit if no microphone is detected
+            yield break; // CORREGIDO: Cambiado de 'return;' a 'yield break;'
         }
 
         // Get the default microphone device. You could also pick from Microphone.devices array.
@@ -104,6 +104,7 @@ public class MicrophoneRecorder : MonoBehaviour
             Debug.LogError("❌ Error: Micrófono no detectó audio después de múltiples intentos.");
             Microphone.End(null); // Stop the mic if it never started getting data
             isRecording = false;
+            yield break; // Exit coroutine
         }
         else
         {
@@ -112,7 +113,7 @@ public class MicrophoneRecorder : MonoBehaviour
     }
 
     // Coroutine to continuously monitor and update the maximum position reached by the microphone's write head.
-    // This helps in diagnostics and as a fallback, but the final length is precisely calculated for saving.
+    // This helps in diagnostics and as a fallback, but the final length is precisely calculated.
     IEnumerator MonitorMicrophonePosition()
     {
         while (isRecording) // Monitor as long as recording is active
@@ -129,10 +130,16 @@ public class MicrophoneRecorder : MonoBehaviour
     }
 
     // This method stops the recording and saves the audio.
-    // It takes the maxPositionReachedByMonitor as an argument for diagnostics/fallback.
-    public void StopRecordingAndSave(int maxPositionReachedByMonitor) 
+    // It now extracts all data *before* stopping the microphone.
+    public void StopRecordingAndSave() 
     {
         if (!isRecording) return; // If not recording, do nothing
+
+        // --- CRITICAL FIX: Extract ALL data from recordedClip BEFORE Microphone.End() ---
+        // This ensures we get all samples before the buffer might be cleared.
+        float[] allRecordedSamplesFromBuffer = new float[recordedClip.samples * recordedClip.channels];
+        recordedClip.GetData(allRecordedSamplesFromBuffer, 0); 
+        Debug.Log($"Debug: Extracted {allRecordedSamplesFromBuffer.Length} samples from initial recordedClip buffer.");
 
         // Stop the microphone recording. This will stop input and set Microphone.GetPosition(null) to 0.
         Microphone.End(null);
@@ -140,13 +147,18 @@ public class MicrophoneRecorder : MonoBehaviour
 
         Debug.Log("🛑 Grabación finalizada. Guardando archivo...");
 
-        if (recordedClip == null)
+        if (recordedClip == null) // This check might be less relevant now, but keep for safety.
         {
-            Debug.LogError("❌ Error: El AudioClip grabado es nulo.");
+            Debug.LogError("❌ Error: El AudioClip grabado es nulo después de detener el micrófono.");
             return;
         }
 
-        // --- CRITICAL FIX: Calculate the EXACT number of samples for the desired duration ---
+        // Use the maximum position we tracked during the recording as the "end point" of data
+        // for the circular buffer logic.
+        int finalPositionFromMonitor = maxRecordedPosition;
+
+
+        // Calculate the EXACT number of samples we EXPECT for the desired recording duration (e.g., 5 seconds)
         // We trust our fixed 5-second wait. This ensures the WAV file duration matches the recording time.
         int desiredRecordingDurationSeconds = 5;
         // The precise total number of samples is (frequency * duration * channels).
@@ -156,18 +168,22 @@ public class MicrophoneRecorder : MonoBehaviour
         Debug.Log($"Debug: Desired recording duration (fixed): {desiredRecordingDurationSeconds} seconds.");
         Debug.Log($"Debug: Actual AudioClip Freq: {recordedClip.frequency}Hz, Channels: {recordedClip.channels}");
         Debug.Log($"Debug: Precise total samples for {desiredRecordingDurationSeconds}s: {preciseTotalSamples}");
-        Debug.Log($"Debug: Max Position tracked by Monitor: {maxPositionReachedByMonitor}"); // Still useful for diagnostics
+        Debug.Log($"Debug: Max Position tracked by Monitor: {finalPositionFromMonitor}"); // Still useful for diagnostics
 
         // --- Sanity Check: Compare tracked position with calculated expected ---
-        // This warning helps understand if the microphone truly recorded less data than expected for 5 seconds.
-        if (maxPositionReachedByMonitor < preciseTotalSamples * 0.9f) // If tracked position is less than 90% of expected
+        if (finalPositionFromMonitor < preciseTotalSamples * 0.9f) // If tracked position is less than 90% of expected
         {
-            Debug.LogWarning($"⚠️ Warning: Monitor tracked ({maxPositionReachedByMonitor}) is less than expected ({preciseTotalSamples}). Recording might be shorter than {desiredRecordingDurationSeconds}s. Proceeding with precise duration.");
+            Debug.LogWarning($"⚠️ Warning: Monitor tracked ({finalPositionFromMonitor}) is less than expected ({preciseTotalSamples}). Recording might be shorter than {desiredRecordingDurationSeconds}s. Proceeding with precise duration.");
         }
-        else if (maxPositionReachedByMonitor > preciseTotalSamples * 1.1f) // If tracked position is more than 110% of expected
+        else if (finalPositionFromMonitor > preciseTotalSamples * 1.1f && finalPositionFromMonitor < allRecordedSamplesFromBuffer.Length + (recordedClip.samples * recordedClip.channels * 0.1f)) // If it tracked more than expected, but within reasonable limits (e.g., 10% more than 10s buffer)
         {
-             Debug.LogWarning($"⚠️ Warning: Monitor tracked ({maxPositionReachedByMonitor}) is much more than expected ({preciseTotalSamples}). This might indicate a buffer issue or misreporting. Using precise duration.");
+             Debug.LogWarning($"⚠️ Warning: Monitor tracked ({finalPositionFromMonitor}) is more than expected ({preciseTotalSamples}). This might indicate buffer wrap. Using precise duration.");
         }
+        else if (finalPositionFromMonitor == 0 && preciseTotalSamples > 0)
+        {
+            Debug.LogWarning("⚠️ Warning: Monitor tracked 0 samples, but expected a positive count. This indicates a problem with data accumulation.");
+        }
+
 
         if (preciseTotalSamples <= 0)
         {
@@ -175,27 +191,52 @@ public class MicrophoneRecorder : MonoBehaviour
             return;
         }
         
-        // Create a new float array with the PRECISELY calculated number of samples.
-        // This array will hold the actual audio data for the final WAV file.
-        float[] samples = new float[preciseTotalSamples]; 
-        
-        // Copy data from the 'recordedClip' (the larger 10-second buffer) into our new,
-        // precisely sized 'samples' array. This extracts only the data for the 5-second duration.
-        recordedClip.GetData(samples, 0); 
+        // --- ADVANCED FIX: Handle potential circular buffer wrap-around on the extracted data ---
+        // This logic is crucial if the microphone's internal buffer wrapped around.
+        // The start position will be the "oldest" data that is still part of our desired 5 seconds.
+        int startReadPos = (finalPositionFromMonitor - preciseTotalSamples);
+        // Adjust for buffer size. Modulo ensures it's within the actual buffer length.
+        startReadPos = (startReadPos % allRecordedSamplesFromBuffer.Length + allRecordedSamplesFromBuffer.Length) % allRecordedSamplesFromBuffer.Length;
+        // Ensure startReadPos is not negative (modulo behavior with negative numbers can be tricky in C#)
+        if (startReadPos < 0) startReadPos = 0; // Fallback, should not happen with the modulo fix.
 
-        // Create the final AudioClip that will be saved.
+
+        float[] finalTrimmedSamples = new float[preciseTotalSamples];
+
+        Debug.Log($"Debug: Extracting {preciseTotalSamples} samples from captured buffer starting at position {startReadPos}");
+
+        // If the data wraps around, we need to copy in two parts:
+        // 1. From startReadPos to the end of the buffer.
+        // 2. From the beginning of the buffer for the remaining part.
+        if (startReadPos + preciseTotalSamples > allRecordedSamplesFromBuffer.Length)
+        {
+            int firstPartLength = allRecordedSamplesFromBuffer.Length - startReadPos;
+            Array.Copy(allRecordedSamplesFromBuffer, startReadPos, finalTrimmedSamples, 0, firstPartLength);
+
+            int secondPartLength = preciseTotalSamples - firstPartLength;
+            Array.Copy(allRecordedSamplesFromBuffer, 0, finalTrimmedSamples, firstPartLength, secondPartLength);
+            Debug.Log($"Debug: Copied {firstPartLength} + {secondPartLength} samples (wrapped).");
+        }
+        else // No wrap-around within the 5-second segment, or buffer not fully filled.
+        {
+            Array.Copy(allRecordedSamplesFromBuffer, startReadPos, finalTrimmedSamples, 0, preciseTotalSamples);
+            Debug.Log($"Debug: Copied {preciseTotalSamples} samples (no wrap).");
+        }
+        // --- END ADVANCED FIX ---
+
+
+        // Create the final AudioClip.
         // The 'lengthSamples' parameter for AudioClip.Create is the total number of samples *per channel*.
-        // So, we divide preciseTotalSamples (which is total samples across all channels) by recordedClip.channels.
         AudioClip trimmedClip = AudioClip.Create(
             "TrimmedClip", 
-            preciseTotalSamples / recordedClip.channels, // Samples *per channel* (e.g., 80000 for mono 5s)
-            recordedClip.channels,                       // Actual number of channels (e.g., 1)
+            preciseTotalSamples / recordedClip.channels, // Samples *per channel*
+            recordedClip.channels,                       // Actual number of channels
             recordedClip.frequency,                      // Actual frequency (e.g., 16000Hz)
             false                                        // Not a streaming clip, all data in memory
         );
         
-        // Set the audio data to the trimmed clip. This populates the AudioClip.
-        trimmedClip.SetData(samples, 0);
+        // Set the audio data to the trimmed clip.
+        trimmedClip.SetData(finalTrimmedSamples, 0);
 
         // Save the precisely trimmed audio clip to a WAV file using WavUtility.
         SaveAsWav(trimmedClip, fileName);
